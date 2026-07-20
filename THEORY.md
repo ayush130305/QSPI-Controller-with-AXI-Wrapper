@@ -3,9 +3,7 @@
 **Project:** QSPI Controller with AXI4-Lite Wrapper
 **Scope:** This document explains the protocol and digital-design theory
 underlying this implementation, with each concept tied directly to the
-corresponding signal, register, or file in the RTL. It is not a general
-protocol tutorial; it assumes the reader is looking at this specific
-codebase alongside it.
+corresponding signal, register, or file in the RTL. 
 
 **Related documents:** [README.md](./README.md) (architecture, register
 map, build instructions, waveform evidence) ·
