@@ -8,7 +8,7 @@ For the underlying protocol theory (AXI4-Lite, SPI/QSPI, clock domain
 crossing), see [docs/THEORY.md](./docs/THEORY.md).
 
 For a signal-level trace of a transaction executing through the actual
-code, see [docs/WALKTHROUGH.md](./docs/WALKTHROUGH.md).
+code, see [docs/WALKTHROUGH.md](.main/docs/WALKTHROUGH.md).
 
 ## Architecture
 
