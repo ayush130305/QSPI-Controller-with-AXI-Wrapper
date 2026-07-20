@@ -1,7 +1,6 @@
 # QSPI Controller with AXI4-Lite Wrapper
 
-A Quad-SPI flash controller with an AXI4-Lite register interface, targeting
-ECP5 FPGAs. Built as part of an internship deliverable at Vicharak.
+A Quad-SPI flash controller with an AXI4-Lite register interface.
 
 ## Background
 
