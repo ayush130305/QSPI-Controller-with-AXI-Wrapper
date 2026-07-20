@@ -67,36 +67,23 @@ AXI4-Lite bus                                          QSPI flash chip
 | 4 | ERROR | sticky, W1C | set if the timeout safety net fires (busy stuck far longer than any legitimate transfer should take) |
 | 31:5 | reserved | | |
 
-## ⚠️ Known limitation: no real multi-byte flow control
-
-`TX_READY`/`RX_READY` tell software when a byte needs servicing, but the
-engine does **not stall** waiting for that to happen — the byte stream
-keeps running at full `qclk` speed regardless. This was a deliberate
-choice: real backpressure requires pausing the engine's internal counters
-mid-transfer, which is only safe if `qclk` is gated/enabled before it
-reaches the physical SCLK pin. That's a board/top-level detail outside
-these RTL files, and it was never confirmed.
-
-**Before relying on multi-byte transfers being lossless**, check whether
-`qclk` is gated anywhere between this module and the flash chip. If it
-is, real stalling can be added safely. If it isn't (`qclk` drives SCLK
-directly), multi-byte transfers are only reliable if the AXI polling loop
-keeps up with the byte rate — document your safe margin, or reduce
-`qclk` frequency accordingly.
-
 ## Building and running the testbench
 
 Requires Verilator 5.x.
 
-**Verilator :**
+**Verilator:**
 ```bash
-verilator --binary --timing --trace -Wno-fatal --top-module tb_qspi_axi_top   qspi_axi_pkg.sv pulse_sync.sv cdc_bridge.sv axi4L_slave.sv   qspi_engine.sv qspi_axi_top.sv qspi_flash_model.sv tb_qspi_axi_top.sv
+verilator --binary --timing --trace -Wno-fatal --top-module tb_qspi_axi_top \
+  qspi_axi_pkg.sv pulse_sync.sv cdc_bridge.sv axi4L_slave.sv \
+  qspi_engine.sv qspi_axi_top.sv qspi_flash_model.sv tb_qspi_axi_top.sv
+./obj_dir/Vtb_qspi_axi_top
 ```
 
 Expected output: `SUMMARY: 17 pass, 0 fail`.
 
-Simulator dump `tb_qspi_axi_top.vcd` in the working directory
-Open it with:
+The simulator dumps `tb_qspi_axi_top.vcd` in the working directory
+(`--trace` is required for this - without it, Verilator silently skips
+the dump). Open it with:
 ```bash
 gtkwave tb_qspi_axi_top.vcd
 ```
@@ -105,15 +92,14 @@ Note the simulation's time unit is **picoseconds**, not nanoseconds — the
 GTKWave time axis and the `From:`/`To:` zoom fields will show `ps`.
 
 To stress the CDC synchronizers with a misaligned clock ratio instead of
-the default 2:1:
+the default 2:1, pass the plusarg directly to the compiled binary:
 ```bash
-vvp sim.out +qclk_period=13.0
+./obj_dir/Vtb_qspi_axi_top +qclk_period=13.0
 ```
 
 ## Verification status
 
-All 17 testbench cases pass on both Icarus Verilog 12.0 and Verilator
-5.032.
+All 17 testbench cases pass on Verilator 5.032.
 
 **RTL bugs found and fixed (qspi_engine.sv, cdc_bridge.sv):**
 - RX capture losing the first nibble/bit of every byte (timing race
@@ -140,8 +126,7 @@ All 17 testbench cases pass on both Icarus Verilog 12.0 and Verilator
 
 Every capture below is from the actual `tb_qspi_axi_top.sv` simulation
 (Verilator 5.032), GTKWave, signals added via their full hierarchical
-path (e.g. `tb_qspi_axi_top.u_dut.u_qspi_engine.phase`). Image files live
-in `./waveforms/` alongside this README.
+path (e.g. `tb_qspi_axi_top.u_dut.u_qspi_engine.phase`).
 
 ### 1. Basic read transaction, phase-by-phase
 
@@ -213,28 +198,28 @@ coincidental completion. `busy_r` and `cs_n` both flip the same cycle
 confirming this was a cut-short abort, not a disguised normal completion.
 
 ### 6. Timeout safety net
- 
+
 <img width="2270" height="362" alt="waveform_6_timeout_safety_net" src="https://github.com/user-attachments/assets/53412420-3de5-4ea1-a961-74f55debd85f" />
- 
+
 **Window:** ~22560ps–26945ps, the full `timeout_safety_net` test (this DUT
 instance's `TIMEOUT_CYCLES` overridden to 200 for testability)
 **Signals:** `timeout_cnt`, `timeout_hit`, `error_r`, `busy_r`
- 
+
 **Proves:** `busy_r` stays high for the entire ~4.3μs stretch (roughly
 215 `qclk` cycles at 20ns each — right around the 200-cycle threshold),
 and `timeout_cnt` is visibly active and counting the whole time, not
 stuck. This is the "big picture" view - it shows the safety net actually
 running for a realistic duration rather than firing suspiciously early or
 late. At this zoom level the exact trigger cycle isn't individually
-readable, which is what the second capture below is for.
- 
-zoomed in
-<img width="2270" height="362" alt="waveform_6b_timeout_safety_net_zoomed" src="https://github.com/user-attachments/assets/7cc0ffdb-6137-4793-ad17-a0094862546d" />
+readable, which is what the zoomed capture below is for.
 
+**Zoomed on the trigger:**
+
+<img width="2270" height="362" alt="waveform_6b_timeout_safety_net_zoomed" src="https://github.com/user-attachments/assets/7cc0ffdb-6137-4793-ad17-a0094862546d" />
 
 **Window:** tight zoom around ~26900ps, same test
 **Signals:** `timeout_cnt`, `timeout_hit`, `error_r`, `busy_r`
- 
+
 **Proves:** the exact causal chain, cycle-by-cycle: `timeout_hit` pulses
 for exactly one cycle the instant `timeout_cnt` reaches its threshold,
 `error_r` sets on the very next edge, and `busy_r` drops on that same
@@ -257,5 +242,3 @@ stays set well after `qspi_done` has gone low again. `AXI_RDATA` reads
 bit-specific and doesn't disturb TX_READY/RX_READY sitting in the same
 register. This is the direct, visual fix for the original "STATUS.done
 is a raw pulse and essentially unpollable" finding.
-
-
