@@ -86,29 +86,17 @@ keeps up with the byte rate — document your safe margin, or reduce
 
 ## Building and running the testbench
 
-Requires Icarus Verilog (`iverilog`/`vvp`) or Verilator 5.x.
+Requires Verilator 5.x.
 
-**Icarus:**
+**Verilator :**
 ```bash
-iverilog -g2012 -o sim.out \
-  qspi_axi_pkg.sv pulse_sync.sv cdc_bridge.sv axi4L_slave.sv \
-  qspi_engine.sv qspi_axi_top.sv qspi_flash_model.sv tb_qspi_axi_top.sv
-vvp sim.out
-```
-
-**Verilator (add `--trace` to actually get a `.vcd` for waveform viewing):**
-```bash
-rm -rf obj_dir
-verilator --binary --timing --trace -Wno-fatal --top-module tb_qspi_axi_top \
-  qspi_axi_pkg.sv pulse_sync.sv cdc_bridge.sv axi4L_slave.sv \
-  qspi_engine.sv qspi_axi_top.sv qspi_flash_model.sv tb_qspi_axi_top.sv
-./obj_dir/Vtb_qspi_axi_top
+verilator --binary --timing --trace -Wno-fatal --top-module tb_qspi_axi_top   qspi_axi_pkg.sv pulse_sync.sv cdc_bridge.sv axi4L_slave.sv   qspi_engine.sv qspi_axi_top.sv qspi_flash_model.sv tb_qspi_axi_top.sv
 ```
 
 Expected output: `SUMMARY: 17 pass, 0 fail`.
 
-Both simulators dump `tb_qspi_axi_top.vcd` in the working directory
-(Icarus always; Verilator only with `--trace`). Open it with:
+Simulator dump `tb_qspi_axi_top.vcd` in the working directory
+Open it with:
 ```bash
 gtkwave tb_qspi_axi_top.vcd
 ```
@@ -225,16 +213,34 @@ coincidental completion. `busy_r` and `cs_n` both flip the same cycle
 confirming this was a cut-short abort, not a disguised normal completion.
 
 ### 6. Timeout safety net
-
-<img width="2270" height="362" alt="waveform_6_timeout_safety_net" src="https://github.com/user-attachments/assets/a6a18cc6-0ace-45fc-abdf-20c22cb96bcd" />
-
-**Window:** tight zoom around ~26900ps (`timeout_safety_net`, this DUT
+ 
+<img width="2270" height="362" alt="waveform_6_timeout_safety_net" src="https://github.com/user-attachments/assets/53412420-3de5-4ea1-a961-74f55debd85f" />
+ 
+**Window:** ~22560ps–26945ps, the full `timeout_safety_net` test (this DUT
 instance's `TIMEOUT_CYCLES` overridden to 200 for testability)
 **Signals:** `timeout_cnt`, `timeout_hit`, `error_r`, `busy_r`
+ 
+**Proves:** `busy_r` stays high for the entire ~4.3μs stretch (roughly
+215 `qclk` cycles at 20ns each — right around the 200-cycle threshold),
+and `timeout_cnt` is visibly active and counting the whole time, not
+stuck. This is the "big picture" view - it shows the safety net actually
+running for a realistic duration rather than firing suspiciously early or
+late. At this zoom level the exact trigger cycle isn't individually
+readable, which is what the second capture below is for.
+ 
+zoomed in
+<img width="2270" height="362" alt="waveform_6b_timeout_safety_net_zoomed" src="https://github.com/user-attachments/assets/7cc0ffdb-6137-4793-ad17-a0094862546d" />
 
-**Proves:** `timeout_hit` pulses for exactly one cycle once `timeout_cnt`
-reaches its threshold, `error_r` sets on the very next edge, and `busy_r`
-drops on that same edge — the full causal chain, cycle-exact, not just
+
+**Window:** tight zoom around ~26900ps, same test
+**Signals:** `timeout_cnt`, `timeout_hit`, `error_r`, `busy_r`
+ 
+**Proves:** the exact causal chain, cycle-by-cycle: `timeout_hit` pulses
+for exactly one cycle the instant `timeout_cnt` reaches its threshold,
+`error_r` sets on the very next edge, and `busy_r` drops on that same
+edge. Together with the wide capture above, this shows both that the
+timeout ran for a realistic, non-trivial duration *and* that the actual
+trigger is provably instantaneous and correctly sequenced - not just
 "these all happen somewhere in the same general area."
 
 ### 7. STATUS sticky-bit behavior (DONE)
