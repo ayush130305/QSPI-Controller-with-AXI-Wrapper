@@ -7,9 +7,9 @@ corresponding signal, register, or file in the RTL. It is not a general
 protocol tutorial; it assumes the reader is looking at this specific
 codebase alongside it.
 
-**Related documents:** [README.md](../README.md) (architecture, register
+**Related documents:** [README.md](./README.md) (architecture, register
 map, build instructions, waveform evidence) ·
-[docs/WALKTHROUGH.md](./WALKTHROUGH.md) (signal-level trace of a
+[WALKTHROUGH.md](./WALKTHROUGH.md) (signal-level trace of a
 transaction executing through the code)
 
 ---
