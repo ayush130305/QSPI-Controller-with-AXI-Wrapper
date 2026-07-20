@@ -98,11 +98,6 @@ gtkwave tb_qspi_axi_top.vcd
 Note the simulation's time unit is **picoseconds**, not nanoseconds — the
 GTKWave time axis and the `From:`/`To:` zoom fields will show `ps`.
 
-To stress the CDC synchronizers with a misaligned clock ratio instead of
-the default 2:1, pass the plusarg directly to the compiled binary:
-```bash
-./obj_dir/Vtb_qspi_axi_top +qclk_period=13.0
-```
 
 ## Verification status
 
