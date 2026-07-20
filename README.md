@@ -1,6 +1,6 @@
 # QSPI Controller with AXI4-Lite Wrapper
 
-A Quad-SPI flash controller with an AXI4-Lite register interface.
+A QSPI flash controller with an AXI4-Lite register interface. It lets a CPU or AXI master control a QSPI flash transaction by writing and reading registers, while a separate QSPI engine generates the actual serial protocol on cs_n and io0-io3.
 
 ## Background
 
