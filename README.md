@@ -157,7 +157,7 @@ in `./waveforms/` alongside this README.
 
 ### 1. Basic read transaction, phase-by-phase
 
-![Basic read transaction phases](./waveforms/waveform_1_basic_read_phases.png)
+<img width="2278" height="468" alt="waveform_1_basic_read_phases" src="https://github.com/user-attachments/assets/694ceb63-2e90-418a-b5e2-ee922d5a9ab1" />
 
 **Window:** ~90ps–1210ps (`read_quad_1byte`)
 **Signals:** `ACLK`, `qclk`, `qspi_start`, `phase`, `bit_cnt`, `cs_n`, `io0_out`, `io0_oe`, `busy_r`
@@ -171,7 +171,7 @@ implement the QSPI phase protocol" claim.
 
 ### 2. RX-timing fix (the nibble-loss bug)
 
-![RX timing fix](./waveforms/waveform_2_rx_timing_fix.png)
+<img width="2246" height="344" alt="waveform_2_rx_timing_fix" src="https://github.com/user-attachments/assets/ede2ce41-8b55-4555-876e-1be2bf23d0aa" />
 
 **Window:** same as above, zoomed into the DATA-phase tail (`read_quad_1byte`, address 0x50 — chosen specifically because its high nibble is non-zero)
 **Signals:** `byte_boundary`, `byte_boundary_d1`, `in_byte`, `qspi_rx_valid`
@@ -185,7 +185,7 @@ the fix, not just a claim that a fix exists.
 
 ### 3. TX priming fix (byte-0-loss bug)
 
-![TX priming fix](./waveforms/waveform_3_tx_priming_fix.png)
+<img width="2238" height="566" alt="waveform_3_tx_priming_fix" src="https://github.com/user-attachments/assets/738e7507-73ad-45d6-b166-797d1f671c3a" />
 
 **Window:** ~3630ps–4750ps (`write_single_1byte`)
 **Signals:** `axi_start`, `tx_data_hold`, `qspi_tx_data`, `tx_shift_byte`, `io0_out`
@@ -199,7 +199,7 @@ very first bit, not a stale value that only becomes right one cycle in.
 
 ### 4. CDC pulse crossing (start signal, ACLK → qclk)
 
-![CDC pulse synchronizer](./waveforms/waveform_4_cdc_pulse_sync.png)
+<img width="2256" height="436" alt="waveform_4_cdc_pulse_sync" src="https://github.com/user-attachments/assets/695df688-797f-4cb8-b454-a07621dbc2fe" />
 
 **Window:** ~90ps–250ps
 **Signals:** `axi_start`, `u_start_sync.toggle_src`, `u_start_sync.sync_ff1/2/3`, `qspi_start`
@@ -213,7 +213,7 @@ disagree, which is the XOR edge-detect working as designed.
 
 ### 5. Abort mid-transaction
 
-![Abort mid-transaction](./waveforms/waveform_5_abort_midtransaction.png)
+<img width="2252" height="436" alt="waveform_5_abort_midtransaction" src="https://github.com/user-attachments/assets/7854b2d7-2e42-42cd-9345-82f24bdb6cb5" />
 
 **Window:** ~22140ps–22570ps (`abort_midtransaction`)
 **Signals:** `phase`, `bit_cnt`, `qspi_abort`, `busy_r`, `cs_n`, `qspi_done`
@@ -226,7 +226,7 @@ confirming this was a cut-short abort, not a disguised normal completion.
 
 ### 6. Timeout safety net
 
-![Timeout safety net](./waveforms/waveform_6_timeout_safety_net.png)
+<img width="2270" height="362" alt="waveform_6_timeout_safety_net" src="https://github.com/user-attachments/assets/a6a18cc6-0ace-45fc-abdf-20c22cb96bcd" />
 
 **Window:** tight zoom around ~26900ps (`timeout_safety_net`, this DUT
 instance's `TIMEOUT_CYCLES` overridden to 200 for testability)
@@ -239,7 +239,7 @@ drops on that same edge — the full causal chain, cycle-exact, not just
 
 ### 7. STATUS sticky-bit behavior (DONE)
 
-![Sticky DONE bit](./waveforms/waveform_7_sticky_done_bit.png)
+<img width="2238" height="350" alt="waveform_7_sticky_done_bit" src="https://github.com/user-attachments/assets/77df8918-5183-490c-8856-a81e59eb1bb7" />
 
 **Window:** ~16800ps–18020ps (`sticky_done_bit`)
 **Signals:** `qspi_done`, `done_latched`, `AXI_RDATA`, `status_w1c_done`
@@ -252,17 +252,4 @@ bit-specific and doesn't disturb TX_READY/RX_READY sitting in the same
 register. This is the direct, visual fix for the original "STATUS.done
 is a raw pulse and essentially unpollable" finding.
 
-## Not yet done
 
-- Synthesis (Yosys + nextpnr-ecp5) has not been run against this RTL -
-  everything above is simulation-only verification
-- No hardware bring-up against a real flash chip yet
-- Real multi-byte flow control, pending the `qclk`-gating question above
-- No mode-bits phase for real quad-I/O opcodes that use them (the FSM is
-  only CMD/ADDR/DUMMY/DATA - see qspi_flash_model.sv's header for which
-  opcodes this affects)
-- Mixed address/data line widths (e.g. quad address + single data) never
-  tested - only matched widths (dual+dual, quad+quad) have coverage
-- NUM_BYTES effective range is capped at 4095 (12-bit) — fine for typical
-  flash page sizes, but a real ceiling if larger single-shot transfers are
-  ever needed
