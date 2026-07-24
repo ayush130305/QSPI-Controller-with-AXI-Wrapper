@@ -12,6 +12,38 @@ creation and will drift if the files are subsequently edited.
 
 ---
 
+## Quick Overview
+
+Before the detailed, file-by-file trace below, here is the same
+transaction flow at a glance, with no file/line references:
+
+1. Software (or the testbench) writes registers over AXI4-Lite.
+2. `axi4L_slave` stores the settings and issues `qspi_start` on a START
+   write.
+3. `cdc_bridge` synchronizes `qspi_start` into the QSPI clock domain.
+4. `qspi_engine` latches the command/address configuration and asserts
+   `busy`.
+5. `qspi_engine` lowers `cs_n`, then emits, in order:
+   - the CMD opcode on `io0`
+   - the address on `io0`/`io1`/`io2`/`io3`, depending on configured width
+   - dummy cycles, if configured
+   - data bytes, for either direction
+6. For a **read**: the QSPI flash drives `io0`-`io3`; `qspi_engine`
+   assembles the received bytes and pulses `qspi_rx_valid`.
+7. For a **write**: `qspi_engine` drives `io0`-`io3` itself, pulsing
+   `qspi_tx_req` before each new byte is needed.
+8. At the end of the DATA phase, `qspi_engine` deasserts `busy` and
+   pulses `qspi_done`.
+9. `cdc_bridge` carries `done`, `rx_valid`, `tx_req`, and `busy` back
+   across to the AXI side.
+10. `axi4L_slave` updates the STATUS registers and RX_DATA, making the
+    result visible to the AXI master.
+
+The remaining sections of this document trace each of these steps
+against the actual signals and line numbers that implement them.
+
+---
+
 ## 1. Clock and reset initialization
 
 The testbench (`tb_qspi_axi_top.sv`) drives two independent, free-running
