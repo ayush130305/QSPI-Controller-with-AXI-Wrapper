@@ -221,13 +221,14 @@ The design applies established AXI4-Lite, QSPI, and CDC theory; it does
 not introduce novel protocol mechanisms.
 
 ## 7. References
-
+ 
 Each entry below is tied to the specific section of this document - and,
 by extension, the specific file(s) in the RTL - it informed.
-
+ 
 | Source | Informs |
 |---|---|
 | ARM. ["AXI Protocol Overview"](https://developer.arm.com/documentation/102202/0300/AXI-protocol-overview) - ARM Developer Documentation | **Section 2** (AXI4-Lite channel structure, VALID/READY handshaking). Directly underlies the AW/W/B/AR/R channel split and handshake logic implemented in `axi4L_slave.sv`. |
+| ARM. ["AMBA AXI and ACE Protocol Specification"](https://developer.arm.com/documentation/ihi0022/latest) - ARM IHI 0022, full specification | **Section 2**. The complete formal specification underlying the overview above - covers AXI3/AXI4/AXI4-Lite/ACE/ACE-Lite in full; consult this rather than the overview page for anything not covered by Section 2's summary. |
 | Winbond Electronics. ["W25Q128JV Datasheet"](https://www.winbond.com/resource-files/W25Q128JV%20RevH%2003102021%20Plus.pdf) - Winbond, Rev. H, 2021 | **Section 4** (QSPI phase structure, opcode/dummy-cycle values). The specific opcode `0x6B` (Fast Read Quad Output) and 8-cycle dummy count used throughout the testbench's opcode table (`qspi_flash_model.sv`) come directly from this part's command set, which is the flash device this design targets. |
 | Gisselquist, D. ["Formally Verifying a QSPI Flash Controller"](https://zipcpu.com/blog/2019/03/27/qflexpress.html) - ZipCPU | **Section 4** (QSPI protocol phases and their rationale, particularly the DUMMY-phase bus-turnaround discussion). A practical design writeup covering the same CMD/ADDR/DUMMY/DATA structure implemented in `qspi_engine.sv`, including edge cases (mode bits, continuous-read mode) this project's phase FSM does not implement - see the note in `qspi_flash_model.sv`'s header regarding the `0xEB` opcode. |
 | Cummings, C. E. ["Clock Domain Crossing (CDC) Design & Verification Techniques Using SystemVerilog"](http://www.sunburst-design.com/papers/CummingsSNUG2008Boston_CDC.pdf) - SNUG Boston 2008 (1st place paper) | **Section 5** (metastability, synchronizer design). The industry-standard reference for the toggle-based pulse synchronizer technique implemented in `pulse_sync.sv`, and for the 2-flop level-synchronizer technique used for `qspi_busy`/`qspi_error` in `cdc_bridge.sv`. |
