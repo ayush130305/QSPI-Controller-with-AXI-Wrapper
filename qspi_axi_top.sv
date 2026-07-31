@@ -1,5 +1,7 @@
 module qspi_axi_top #(
-  parameter int unsigned TIMEOUT_CYCLES = 20'hFFFFF
+  parameter int unsigned TIMEOUT_CYCLES = 20'hFFFFF,
+  parameter logic [31:0] XIP_BASE        = 32'h0100_0000,
+  parameter logic [31:0] XIP_SIZE        = 32'h0100_0000
 )(
   input  logic        ACLK,
   input  logic        ARESETn,   // active-low, AXI-side reset
@@ -7,7 +9,7 @@ module qspi_axi_top #(
   input  logic        qclk,
   input  logic        qclk_rst,  // active-high, QSPI-side reset
 
-  //AXI4-Lite slave interface (external - to the real bus master)
+  //AXI4-Lite slave interface (external - to the real bus master, register path)
   input  logic [31:0] AXI_AWADDR,
   input  logic        AXI_AWVALID,
   output logic        AXI_AWREADY,
@@ -30,6 +32,18 @@ module qspi_axi_top #(
   output logic        AXI_RVALID,
   input  logic        AXI_RREADY,
 
+  //XIP AXI4-Lite slave interface (external - to a CPU's fetch/load unit,
+  //memory-mapped, read-only). A separate port from the register interface
+  //above, deliberately - see qspi_xip_slave.sv header for why.
+  input  logic [31:0] XIP_ARADDR,
+  input  logic        XIP_ARVALID,
+  output logic        XIP_ARREADY,
+
+  output logic [31:0] XIP_RDATA,
+  output logic [1:0]  XIP_RRESP,
+  output logic        XIP_RVALID,
+  input  logic        XIP_RREADY,
+
   //QSPI physical pins (external - to the real flash chip)
   output logic        cs_n,
 
@@ -39,7 +53,7 @@ module qspi_axi_top #(
   output logic        io3_out, output logic io3_oe, input logic io3_in
 );
 
-  //Internal wiring: axi4L_slave <-> cdc_bridge (ACLK domain)
+  //Internal wiring: axi4L_slave <-> qspi_arbiter (ACLK domain, register path)
   logic        int_a_start;
   logic        int_a_abort;
   logic [31:0] int_a_ctrl_cmd;
@@ -52,6 +66,33 @@ module qspi_axi_top #(
   logic        int_a_tx_req;
   logic [7:0]  int_a_rx_data;
   logic        int_a_rx_valid;
+  logic [31:0] int_xip_cfg;
+
+  //Internal wiring: qspi_xip_slave <-> qspi_arbiter (ACLK domain, XIP path)
+  logic        int_x_start;
+  logic [31:0] int_x_ctrl_cmd;
+  logic [31:0] int_x_addr;
+  logic [31:0] int_x_num_bytes;
+  logic        int_x_busy;
+  logic        int_x_done;
+  logic        int_x_error;
+  logic [7:0]  int_x_rx_data;
+  logic        int_x_rx_valid;
+
+  //Internal wiring: qspi_arbiter <-> cdc_bridge (ACLK domain, merged/single path -
+  //same role int_a_* played before the arbiter existed)
+  logic        int_m_start;
+  logic        int_m_abort;
+  logic [31:0] int_m_ctrl_cmd;
+  logic [31:0] int_m_addr;
+  logic [31:0] int_m_num_bytes;
+  logic        int_m_busy;
+  logic        int_m_done;
+  logic        int_m_error;
+  logic [7:0]  int_m_tx_data;
+  logic        int_m_tx_req;
+  logic [7:0]  int_m_rx_data;
+  logic        int_m_rx_valid;
 
   //Internal wiring: cdc_bridge <-> qspi_engine (qclk domain)
   logic        int_q_start;
@@ -104,7 +145,78 @@ module qspi_axi_top #(
     .qspi_tx_data   (int_a_tx_data),
     .qspi_tx_req    (int_a_tx_req),
     .qspi_rx_data   (int_a_rx_data),
-    .qspi_rx_valid  (int_a_rx_valid)
+    .qspi_rx_valid  (int_a_rx_valid),
+
+    .xip_cfg        (int_xip_cfg)
+  );
+
+  qspi_xip_slave #(
+    .XIP_BASE (XIP_BASE),
+    .XIP_SIZE (XIP_SIZE)
+  ) u_xip_slave (
+    .ACLK (ACLK),
+    .ARESETn (ARESETn),
+
+    .AXI_ARADDR  (XIP_ARADDR),
+    .AXI_ARVALID (XIP_ARVALID),
+    .AXI_ARREADY (XIP_ARREADY),
+    .AXI_RDATA   (XIP_RDATA),
+    .AXI_RRESP   (XIP_RRESP),
+    .AXI_RVALID  (XIP_RVALID),
+    .AXI_RREADY  (XIP_RREADY),
+
+    .xip_cfg (int_xip_cfg),
+
+    .x_start     (int_x_start),
+    .x_ctrl_cmd  (int_x_ctrl_cmd),
+    .x_addr      (int_x_addr),
+    .x_num_bytes (int_x_num_bytes),
+    .x_busy      (int_x_busy),
+    .x_done      (int_x_done),
+    .x_error     (int_x_error),
+    .x_rx_data   (int_x_rx_data),
+    .x_rx_valid  (int_x_rx_valid)
+  );
+
+  qspi_arbiter u_arbiter (
+    .ACLK    (ACLK),
+    .ARESETn (ARESETn),
+
+    .a_start     (int_a_start),
+    .a_abort     (int_a_abort),
+    .a_ctrl_cmd  (int_a_ctrl_cmd),
+    .a_addr      (int_a_addr),
+    .a_num_bytes (int_a_num_bytes),
+    .a_tx_data   (int_a_tx_data),
+    .a_busy      (int_a_busy),
+    .a_done      (int_a_done),
+    .a_error     (int_a_error),
+    .a_tx_req    (int_a_tx_req),
+    .a_rx_data   (int_a_rx_data),
+    .a_rx_valid  (int_a_rx_valid),
+
+    .x_start     (int_x_start),
+    .x_ctrl_cmd  (int_x_ctrl_cmd),
+    .x_addr      (int_x_addr),
+    .x_num_bytes (int_x_num_bytes),
+    .x_busy      (int_x_busy),
+    .x_done      (int_x_done),
+    .x_error     (int_x_error),
+    .x_rx_data   (int_x_rx_data),
+    .x_rx_valid  (int_x_rx_valid),
+
+    .axi_start     (int_m_start),
+    .axi_abort     (int_m_abort),
+    .axi_ctrl_cmd  (int_m_ctrl_cmd),
+    .axi_addr      (int_m_addr),
+    .axi_num_bytes (int_m_num_bytes),
+    .axi_tx_data   (int_m_tx_data),
+    .axi_busy      (int_m_busy),
+    .axi_done      (int_m_done),
+    .axi_error     (int_m_error),
+    .axi_tx_req    (int_m_tx_req),
+    .axi_rx_data   (int_m_rx_data),
+    .axi_rx_valid  (int_m_rx_valid)
   );
 
   cdc_bridge u_cdc (
@@ -113,18 +225,18 @@ module qspi_axi_top #(
     .qclk      (qclk),
     .qclk_rst  (qclk_rst),
 
-    .axi_start      (int_a_start),
-    .axi_abort      (int_a_abort),
-    .axi_ctrl_cmd   (int_a_ctrl_cmd),
-    .axi_addr       (int_a_addr),
-    .axi_num_bytes  (int_a_num_bytes),
-    .axi_busy       (int_a_busy),
-    .axi_done       (int_a_done),
-    .axi_error      (int_a_error),
-    .axi_tx_data    (int_a_tx_data),
-    .axi_tx_req     (int_a_tx_req),
-    .axi_rx_data    (int_a_rx_data),
-    .axi_rx_valid   (int_a_rx_valid),
+    .axi_start      (int_m_start),
+    .axi_abort      (int_m_abort),
+    .axi_ctrl_cmd   (int_m_ctrl_cmd),
+    .axi_addr       (int_m_addr),
+    .axi_num_bytes  (int_m_num_bytes),
+    .axi_busy       (int_m_busy),
+    .axi_done       (int_m_done),
+    .axi_error      (int_m_error),
+    .axi_tx_data    (int_m_tx_data),
+    .axi_tx_req     (int_m_tx_req),
+    .axi_rx_data    (int_m_rx_data),
+    .axi_rx_valid   (int_m_rx_valid),
 
     .qspi_start     (int_q_start),
     .qspi_abort     (int_q_abort),

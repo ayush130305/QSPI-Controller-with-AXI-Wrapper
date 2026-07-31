@@ -7,6 +7,21 @@ package qspi_axi_pkg;
   localparam int REG_STATUS    = 'h0C; // read-only status register to monitor the QSPI engine's state and flags
   localparam int REG_TX_DATA   = 'h10; // multibit register to write data to be transmitted over QSPI
   localparam int REG_RX_DATA   = 'h14; // multibit register to read data received over QSPI
+  localparam int REG_XIP_CFG   = 'h18; // XIP configuration - set ONCE at boot, before enabling XIP; see bit layout below
+
+  // XIP_CFG bit layout - every XIP-triggered read reuses this fixed
+  // opcode/width/dummy config, unlike CTRL_CMD which is re-specified per
+  // transaction. A CPU instruction fetch has no way to program a register
+  // before each access, so XIP has to work off one pre-agreed configuration.
+  //   bit31     XIP_ENABLE   - gates whether qspi_xip_slave accepts requests at all
+  //                            (deliberately far from the other fields below -
+  //                            bit0 would overlap OPCODE[7:0], corrupting it)
+  //   bit12     ADDR_WIDTH   - 0=24-bit, 1=32-bit (same encoding as CTRL_CMD)
+  //   bits11:10 DATA_LINES   - same LW_SINGLE/DUAL/QUAD encoding as CTRL_CMD
+  //   bits9:8   ADDR_LINES   - same encoding
+  //   bits20:13 DUMMY_CYCLES
+  //   bits7:0   OPCODE       - the fixed read opcode used for every XIP access
+  localparam int XIP_CFG_BIT_ENABLE = 31;
 
   localparam int STATUS_BIT_BUSY     = 0; // level, read-only
   localparam int STATUS_BIT_DONE     = 1; // once high stays high until software writes REG_STATUS with bit1 set to 1

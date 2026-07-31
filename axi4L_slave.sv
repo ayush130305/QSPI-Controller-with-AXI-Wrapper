@@ -83,7 +83,9 @@ module axi4L_slave (
     output logic [7:0]  qspi_tx_data, // tx data register is used to write data to be transmitted over QSPI
     input  logic        qspi_tx_req,   // engine asking for the next byte
     input  logic [7:0]  qspi_rx_data, // rx data register is used to read data received over QSPI
-    input  logic        qspi_rx_valid  // engine says: this byte is ready to capture
+    input  logic        qspi_rx_valid,  // engine says: this byte is ready to capture
+
+    output logic [31:0] xip_cfg // XIP_CFG register value, exposed for qspi_xip_slave.sv to consume
 );
 
     // internal register storage for the control and status registers
@@ -91,6 +93,8 @@ module axi4L_slave (
     logic [31:0] reg_addr; // address register is used to specify the address of the data to be transferred over QSPI
     logic [31:0] reg_num_bytes; // num bytes register is used to specify the number of bytes to be transferred over QSPI
     logic [31:0] reg_tx_data; // tx data register is used to write data to be transmitted over QSPI
+    logic [31:0] reg_xip_cfg; // XIP configuration register - see qspi_axi_pkg.sv for bit layout
+    assign xip_cfg = reg_xip_cfg;
 
     // write channel FSM
     write_state_t state; // state variable to keep track of the current state of the write channel FSM
@@ -213,6 +217,7 @@ end
             REG_NUM_BYTES: AXI_RDATA = reg_num_bytes;
             REG_STATUS:    AXI_RDATA = {27'd0, error_latched, rx_ready_latched, tx_ready_latched, done_latched, qspi_busy};
             REG_TX_DATA:   AXI_RDATA = '0;  // write-only, reads return 0
+            REG_XIP_CFG:   AXI_RDATA = reg_xip_cfg;
             REG_RX_DATA:   AXI_RDATA = {24'd0, qspi_rx_data};
             default:       AXI_RDATA = '0; // unknown address - return 0
         endcase
@@ -285,6 +290,7 @@ if (!ARESETn) begin
     reg_addr      <= '0;
     reg_num_bytes <= '0;
     reg_tx_data   <= '0;
+    reg_xip_cfg   <= '0; // XIP_ENABLE defaults to 0 - XIP is off until software explicitly configures and enables it
 end else if (do_write) begin
     case (eff_addr)
     REG_CTRL_CMD:  for (int i = 0; i < 4; i++)
@@ -295,6 +301,8 @@ end else if (do_write) begin
                         if (eff_strb[i]) reg_num_bytes[i*8 +: 8] <= eff_data[i*8 +: 8];
     REG_TX_DATA:   for (int i = 0; i < 4; i++)
                         if (eff_strb[i]) reg_tx_data[i*8 +: 8] <= eff_data[i*8 +: 8];
+    REG_XIP_CFG:   for (int i = 0; i < 4; i++)
+                        if (eff_strb[i]) reg_xip_cfg[i*8 +: 8] <= eff_data[i*8 +: 8];
     default: ;
     endcase
     end

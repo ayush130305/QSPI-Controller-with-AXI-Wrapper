@@ -268,7 +268,6 @@ module tb_qspi_axi_top;
 
 
   // Test sequence
-
   //   1  read_quad_1byte          baseline quad-line read still works
   //   2  read_single_1byte        single-line RX-masking fix
   //   3  read_dual_1byte          dual-line RX-masking fix
