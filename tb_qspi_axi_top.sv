@@ -1,5 +1,27 @@
 // tb_qspi_axi_top.sv
-
+//
+// Final directed-test suite for qspi_axi_top. Extends the original
+// single-test tb with the coverage gaps identified during review:
+//   - write direction (dir=1)
+//   - single/dual/quad data-line widths (not just quad)
+//   - multi-byte transfers
+//   - 32-bit vs 24-bit address
+//   - dummy_cycles == 0
+//   - NUM_BYTES >= 256 (truncation check)
+//   - back-to-back transactions
+//   - start asserted again while already busy
+//   - BRESP/RRESP checked on every transaction, not just RDATA
+//   - STATUS.done (bit 1) checked directly, not just inferred from busy
+//
+// Some of these tests are EXPECTED TO FAIL against the current RTL -
+// they were written to catch (and did catch, in review) real bugs:
+//   - write-direction: byte 0 is lost (cdc_bridge never primes qspi_tx_data
+//     before the engine's first byte-load point)
+//   - single/dual-line reads: qspi_engine ORs in all 4 IO lines
+//     unconditionally regardless of data_lines, corrupting the byte
+//   - NUM_BYTES >= 256: only the low 8 bits are used, silently wrapping
+// Each test reports PASS/FAIL independently; a FAIL here means the RTL
+// bug is real and reproducible, not that the test is broken.
 //
 // CDC clock-ratio note: this suite runs against ALIGNED_CLOCKS by default
 // (10ns/20ns, clean 2:1). Re-run with +qclk_period=13.0 on the vvp command
@@ -265,9 +287,12 @@ module tb_qspi_axi_top;
   localparam logic [7:0] OP_TEST_QUAD_ND   = 8'hF0;
   localparam logic [7:0] OP_TEST_DUAL_ADDR = 8'hBD;
   localparam logic [7:0] OP_TEST_QUAD_ADDR = 8'hEB;
+  localparam logic [7:0] OP_TEST_QUAD_ADDR_SINGLE_DATA = 8'hDD;
 
-
+  // ==================================================================
   // Test sequence
+  // ==================================================================
+  // Quick reference - what each numbered block below actually checks:
   //   1  read_quad_1byte          baseline quad-line read still works
   //   2  read_single_1byte        single-line RX-masking fix
   //   3  read_dual_1byte          dual-line RX-masking fix
@@ -559,6 +584,17 @@ module tb_qspi_axi_top;
       // clear it so it doesn't leak into anything after
       axi_write(REG_STATUS, 32'h1 << STATUS_BIT_ERROR);
     end
+
+    // ---- 18. Mixed line-width combination: quad ADDRESS + single DATA ----
+    // Tests: previously only matched widths (dual+dual, quad+quad) and the
+    // single-address+quad-data direction (via OP_QUAD_READ) had coverage.
+    // This is the genuinely untested opposite mixed combination - wider
+    // address phase than data phase.
+    // Expected: REG_RX_DATA == 0x82 (mem[130] == 130).
+    run_txn(0, LW_SINGLE, LW_QUAD, 0, 8, OP_TEST_QUAD_ADDR_SINGLE_DATA, 32'd130, 32'd1, 8'h00, done_ok);
+    axi_read(REG_RX_DATA, rx_val);
+    report("mixed_quad_addr_single_data", done_ok && rx_val[7:0]===8'h82,
+           $sformatf("(got %02h expected 82)", rx_val[7:0]));
 
     $display("=====================================");
     $display("SUMMARY: %0d pass, %0d fail (qclk_period=%0.1fns)", pass_count, fail_count, qclk_period);

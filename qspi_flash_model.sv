@@ -81,6 +81,10 @@ module qspi_flash_model #(
   localparam logic [7:0] OP_TEST_QUAD_ND  = 8'hF0; // test-fixture only, see header
   localparam logic [7:0] OP_TEST_DUAL_ADDR = 8'hBD; // test-fixture only, see header
   localparam logic [7:0] OP_TEST_QUAD_ADDR = 8'hEB; // simplified, see header
+  localparam logic [7:0] OP_TEST_QUAD_ADDR_SINGLE_DATA = 8'hDD; // test-fixture only: the
+              // genuinely untested mixed-width direction - quad ADDRESS lines with single
+              // DATA lines. Single-address+quad-data is already covered by OP_QUAD_READ;
+              // this is deliberately the opposite combination.
 
   // Same purpose as qspi_engine.sv's lines_per_clock function - converts a
   // line-width encoding into bits transferred per qclk cycle. Kept as a
@@ -142,6 +146,7 @@ module qspi_flash_model #(
       OP_TEST_QUAD_ND:  begin dec_dir=1'b0; dec_data_lines=LW_Q; dec_addr_lines=LW_S; dec_dummy_cycles=8'd0; dec_addr_bytes=8'd3; end
       OP_TEST_DUAL_ADDR: begin dec_dir=1'b0; dec_data_lines=LW_D; dec_addr_lines=LW_D; dec_dummy_cycles=8'd8; dec_addr_bytes=8'd3; end
       OP_TEST_QUAD_ADDR: begin dec_dir=1'b0; dec_data_lines=LW_Q; dec_addr_lines=LW_Q; dec_dummy_cycles=8'd8; dec_addr_bytes=8'd3; end
+      OP_TEST_QUAD_ADDR_SINGLE_DATA: begin dec_dir=1'b0; dec_data_lines=LW_S; dec_addr_lines=LW_Q; dec_dummy_cycles=8'd8; dec_addr_bytes=8'd3; end
       default:          begin dec_dir=1'b0; dec_data_lines=LW_S; dec_addr_lines=LW_S; dec_dummy_cycles=8'd8; dec_addr_bytes=8'd3; end
     endcase
   end
@@ -222,7 +227,10 @@ module qspi_flash_model #(
           // it explicitly gates output on phase==FM_DATA, so DUMMY is
           // silent by omission) - this is purely a cycle-counter waiting
           // out the bus-turnaround gap before priming out_byte/next_addr_byte
-          // for the DATA phase that follows. 
+          // for the DATA phase that follows. addr_shift is fully settled by
+          // now (no more shifting happens once ADDR ends), so no "+io0_in"
+          // trick is needed here the way it was in the immediate-transition
+          // branch above.
           if (bitcnt == dec_dummy_cycles - 1) begin
             phase          <= FM_DATA; bitcnt <= '0; nibblecnt <= '0;
             out_byte       <= mem[addr_shift[7:0]];
@@ -251,7 +259,14 @@ module qspi_flash_model #(
             endcase
 
             if (nibblecnt == clocks_per_byte - 1) begin
-
+              // Byte complete - report it to the testbench via
+              // written_valid/written_byte. written_byte is computed
+              // directly from in_byte_acc plus the CURRENT cycle's bits
+              // (not just read back from in_byte_acc after its own update)
+              // for the same NBA-timing reason documented at length in
+              // qspi_engine.sv - reading the register the SAME cycle it's
+              // being updated would only see the pre-this-cycle value,
+              // missing the final bit/nibble.
               written_valid <= 1'b1;
               case (dec_data_lines)
                 LW_S: written_byte <= {in_byte_acc[6:0], io0_in};
@@ -270,7 +285,11 @@ module qspi_flash_model #(
     end
   end
 
-
+  // Pin driving - only actually asserts anything during a read's DATA
+  // phase (phase==FM_DATA && !dec_dir). Every other phase/direction
+  // combination leaves io*_oe at the 0 default set at the top of this
+  // block, correctly leaving the bus for the DUT (or, in DUMMY, for
+  // neither side) to drive.
   always_comb begin
     io0_oe = 0; io1_oe = 0; io2_oe = 0; io3_oe = 0;
     io0_out = 0; io1_out = 0; io2_out = 0; io3_out = 0;

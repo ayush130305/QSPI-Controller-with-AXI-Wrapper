@@ -1,11 +1,13 @@
 # Implementation Walkthrough: A Transaction Traced Through the Code
 
 **Project:** QSPI Controller with AXI4-Lite Wrapper
-**Scope:** This document traces a single transaction end-to-end through
+**Scope:** This document traces transactions end-to-end through
 the actual RTL and testbench, identifying every relevant signal, its
 governing file, and its approximate line number. It assumes familiarity
 with the concepts in [docs/THEORY.md](./THEORY.md); this document covers
-implementation, not protocol theory.
+implementation, not protocol theory. Sections 1-11 cover the core
+register-path transaction; Sections 12-15 cover the XIP-specific
+additions built on top of it.
 
 **Line numbers** reflect the project files as of this document's
 creation and will drift if the files are subsequently edited.
@@ -38,6 +40,12 @@ transaction flow at a glance, with no file/line references:
    across to the AXI side.
 10. `axi4L_slave` updates the STATUS registers and RX_DATA, making the
     result visible to the AXI master.
+
+For a memory-mapped XIP read, steps 1-2 are replaced by a plain AXI read
+landing in the XIP address window (Section 12), and the fixed
+configuration comes from `XIP_CFG` rather than a fresh CTRL_CMD write.
+Everything from step 3 onward is unchanged - the same engine, the same
+CDC bridge.
 
 The remaining sections of this document trace each of these steps
 against the actual signals and line numbers that implement them.
@@ -73,7 +81,7 @@ Each write is processed by `axi4L_slave.sv`'s write-channel FSM:
 | `aw_hs`, `w_hs`, `b_hs`, `ar_hs`, `r_hs` | `axi4L_slave.sv` : ~100 | The five AXI handshake conditions |
 | write-FSM `always_ff` | `axi4L_slave.sv` : 109 | Advances `state` |
 | address/data latch `always_ff` | `axi4L_slave.sv` : 130 | Latches whichever of AW/W arrives first |
-| `reg_ctrl_cmd`, `reg_addr`, `reg_num_bytes`, `reg_tx_data` | `axi4L_slave.sv` : ~90 | The stored register values |
+| `reg_ctrl_cmd`, `reg_addr`, `reg_num_bytes`, `reg_tx_data`, `reg_xip_cfg` | `axi4L_slave.sv` : ~90 | The stored register values |
 | `eff_addr` / `eff_data` / `eff_strb` | `axi4L_slave.sv` : 155 | Resolves live-vs-latched address/data for the current cycle |
 | `do_write` | `axi4L_slave.sv` : 166 | Asserted on the exact cycle a write completes |
 | register-write `for` loops | `axi4L_slave.sv` : 290-296 | Per-register, walks `WSTRB` byte lanes into the target register |
@@ -166,7 +174,7 @@ definition in the source:
 |---|---|---|
 | `done_latched`, `tx_ready_latched`, `rx_ready_latched`, `error_latched` | `axi4L_slave.sv` : 224 | The four sticky STATUS bits |
 | `status_w1c_done` / `status_w1c_error` | `axi4L_slave.sv` : 227-230 | Write-1-to-clear detection |
-| `tx_data_write` / `rx_data_read` | `axi4L_slave.sv` : 234-236 | Auto-clear detection for TX_READY/RX_READY |
+| `tx_data_write` / `rx_data_read` | `axi4L_slave.sv` : 234-236 | Auto-clear detection for TX/RX_READY |
 
 `run_txn`'s companion task, `wait_for_done` (`tb_qspi_axi_top.sv` : 196),
 polls `REG_STATUS` until `STATUS_BIT_BUSY` clears, then the testbench
@@ -197,3 +205,64 @@ protocol - which is precisely what the testbench is verifying.
 | Timeout | `timeout_cnt`, `timeout_hit` | `qspi_engine.sv` : 130, 137 |
 | Start-while-busy | `qspi_start` is only evaluated inside the `!busy_r` branch | `qspi_engine.sv` : 151 |
 | Back-to-back transactions | All per-transaction state (`phase`, `bit_cnt`, `byte_bit_cnt`) resets on every `!busy_r` cycle | `qspi_engine.sv` : 151, 257 |
+
+---
+
+## 12. XIP: request path (memory-mapped read → engine)
+
+`qspi_xip_slave.sv` is a second, read-only AXI4-Lite slave sitting on its
+own address window. A CPU issuing an ordinary read at an address inside
+that window triggers this path:
+
+| Element | File | Description |
+|---|---|---|
+| `AXI_ARREADY = (state == XIP_IDLE)` | `qspi_xip_slave.sv` | Always asserted when idle, **regardless** of enable state - disabled/out-of-range requests are still accepted, then answered with an error. Gating ARREADY on enable was an earlier, real AXI protocol violation (see README bug list) - a slave must always eventually respond. |
+| `addr_in_range_live` | `qspi_xip_slave.sv` | Computed from the **live** `AXI_ARADDR`, not the latched version - checking the latched address on the same cycle it updates gives the previous transaction's range result, not this one's |
+| `flash_addr = ar_addr_latched - XIP_BASE` | `qspi_xip_slave.sv` | Address translation, once past the same-cycle latch race |
+| `xip_state_t` enum: `XIP_IDLE, XIP_REQ, XIP_COLLECT, XIP_RESP, XIP_SETTLE` | `qspi_xip_slave.sv` | The whole request lifecycle |
+| `x_ctrl_cmd` built from `xip_cfg` | `qspi_xip_slave.sv` | dir hardcoded to read (0), start pulsed for one cycle in `XIP_REQ`, everything else copied from the fixed boot-time `XIP_CFG` register |
+
+`XIP_SETTLE` is a deliberate one-cycle gap between completing a
+transaction and being ready to accept the next one - without it, a very
+fast-resolving transaction (the immediate-error paths) could let the FSM
+cycle back to `XIP_IDLE` and re-accept a still-lingering `ARVALID` from a
+master that hasn't cleared it yet. This was a real, simulator-observable
+race (see README bug list).
+
+## 13. Arbitration (shared access to the engine)
+
+Both the register path and the XIP path can request the engine.
+`qspi_arbiter.sv` sits between them and the single set of request/
+response ports `cdc_bridge.sv` exposes:
+
+| Element | File | Description |
+|---|---|---|
+| `grant_t` enum: `GNT_NONE, GNT_REG, GNT_XIP` | `qspi_arbiter.sv` | Register path wins if both request the same cycle |
+| `busy_seen` | `qspi_arbiter.sv` | Grant release requires having first observed `axi_busy` actually go high - otherwise the CDC round-trip latency between `axi_start` and `axi_busy` asserting could cause the arbiter to release the grant before the transaction even started |
+| response routing (`route_to_reg`/`route_to_xip`) | `qspi_arbiter.sv` | Each requester only ever sees `busy`/`done`/`error`/`tx_req`/`rx_valid` while it holds the grant. **Exception:** `rx_data` itself is passed through unconditionally, not gated - it's an inert value with no meaning of its own until a requester also sees its own `rx_valid`; gating the data too broke the register path's own post-transaction reads |
+| `assign axi_abort = a_abort;` | `qspi_arbiter.sv` | **Abort is NOT gated by grant at all.** Unlike every other signal above, it's forwarded to the engine unconditionally regardless of which side holds the grant - a register-path ABORT write can cut short an XIP-triggered transaction that's currently in flight. This is deliberate: abort is a safety/override mechanism, not a normal arbitrated request, and gating it would leave no way to recover a hung XIP transaction short of a full reset. |
+
+## 14. XIP byte assembly
+
+`qspi_xip_slave.sv`'s `XIP_COLLECT` state assembles up to 4 individually-arriving
+bytes into one 32-bit word for the requesting master:
+
+| Element | File | Description |
+|---|---|---|
+| `x_rx_valid_d1` | `qspi_xip_slave.sv` | `x_rx_data` only settles to its correct new value the cycle *after* `x_rx_valid` pulses (same NBA-race class as Section 7's RX-timing fix) - sampling is delayed one cycle to match |
+| byte-position `case` on `byte_count` | `qspi_xip_slave.sv` | Little-endian assembly: the first-arriving byte (lowest address) lands in the LOW byte of the word, matching how a real CPU (ARM/RISC-V/x86) expects a memory-mapped word read to be laid out |
+
+## 15. XIP: distinguishing normal completion from abort
+
+Once abort became global (Section 13), `qspi_xip_slave.sv` needed a way
+to tell "the transaction finished normally" apart from "the transaction
+was cut short by an abort while it held the grant" - `qspi_done` never
+pulses on an abort, and no further `rx_valid` pulses are coming either,
+so without an explicit check, `XIP_COLLECT` would simply wait forever
+for events that would never arrive.
+
+| Element | File | Description |
+|---|---|---|
+| `engine_busy_seen` | `qspi_xip_slave.sv` | Also reused to guard against a *different* stale-state hazard: an error latched by a previous transaction can still be visible for a few cycles into a new one, since the CDC-synced view of "error cleared" lags behind the real clearing. Gating on having observed `busy` high first for *this* transaction sidesteps both problems with one flag. |
+| `drain_cnt` / `XIP_DRAIN_CYCLES` | `qspi_xip_slave.sv` | The check for "busy dropped without completing" cannot fire the instant `busy` drops - during a completely normal completion, the fast level-synced `busy` can drop before the slower, pulse-synced `rx_valid` for the *final* byte has actually arrived. Firing immediately misreported some genuinely successful fetches as aborted. The fix waits `XIP_DRAIN_CYCLES` (matching the same margin pattern as `qspi_arbiter.sv`'s own `DRAIN_CYCLES`) before concluding the transaction was actually cut short rather than just finishing slightly late. |
+| ordering within `XIP_COLLECT` | `qspi_xip_slave.sv` | The `x_rx_valid_d1` check is placed *before* the drain-margin abort check in the `if`/`else if` chain - not because of a same-cycle priority conflict (that was ruled out empirically), but so a final byte arriving partway through the drain window is still correctly processed as a completion rather than the window being allowed to run out first. |

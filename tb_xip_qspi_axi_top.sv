@@ -69,7 +69,7 @@ module tb_xip_qspi_axi_top;
 
   // ---------------- DUT ----------------
   qspi_axi_top #(
-    .TIMEOUT_CYCLES(500),
+    .TIMEOUT_CYCLES(150),
     .XIP_BASE(32'h0100_0000),
     .XIP_SIZE(32'h0100_0000)
   ) u_dut (
@@ -181,42 +181,34 @@ module tb_xip_qspi_axi_top;
     logic [31:0] xip_cfg_val;
 
     fork
-      begin #100000; $display("GLOBAL TIMEOUT"); $finish; end
+      begin #500000; $display("GLOBAL TIMEOUT"); $finish; end
     join_none
 
     @(posedge ARESETn);
     repeat (5) @(posedge ACLK);
 
     // ---- 1. XIP Disabled / Out of Range Rejection ----
-    // Tests: qspi_xip_slave responds immediately with DECERR if XIP_ENABLE is 0.
     xip_read(32'h0100_0004, rdata, rresp);
     report("xip_disabled_reject", rresp === 2'b10, "(Expected DECERR 2'b10 when disabled)");
 
     // ---- 2. Baseline XIP Fetch ----
-    // Configure XIP_CFG: ENABLE=1, DUMMY=8, Single-line, OPCODE=0x0B (Fast Read)
     xip_cfg_val = (1 << XIP_CFG_BIT_ENABLE) | (8 << 13) | 32'h0B;
     axi_write(REG_XIP_CFG, xip_cfg_val);
 
-    // Fetch from 0x0100_0010 -> offset 0x10.
-    // The flash model maps mem[i] = i, so 4 bytes from 0x10 are: 0x13, 0x12, 0x11, 0x10.
     xip_read(32'h0100_0010, rdata, rresp);
     report("xip_baseline_fetch", (rresp === 2'b00) && (rdata === 32'h13121110), 
            $sformatf("(Got %08h, Expected 13121110, Resp %b)", rdata, rresp));
 
     // ---- 3. Out of bounds range check ----
-    // Reads outside XIP_BASE + XIP_SIZE should be rejected even if enabled.
     xip_read(32'h0200_0000, rdata, rresp);
     report("xip_out_of_range", rresp === 2'b10, "(Expected DECERR 2'b10 for out-of-bounds address)");
 
     // ---- 4. Arbiter Priority (Register vs XIP collision) ----
-    // Fire both a register read (via status) and an XIP fetch simultaneously.
-    // Arbiter should serve the Register request first.
     begin
       logic [31:0] ax_data, xp_data;
       logic [1:0]  ax_resp, xp_resp;
       
       @(posedge ACLK);
-      // Manually assert both ARVALIDs on the same cycle to force a collision
       AXI_ARADDR = REG_STATUS; AXI_ARVALID = 1'b1;
       XIP_ARADDR = 32'h0100_0020; XIP_ARVALID = 1'b1;
 
@@ -242,6 +234,179 @@ module tb_xip_qspi_axi_top;
       report("arbiter_collision_resolution", 
              (ax_resp === 2'b00) && (xp_resp === 2'b00) && (xp_data === 32'h23222120),
              "(Both transactions completed successfully after collision)");
+    end
+
+    // ---- 5. Abort is global - cuts short a transaction even while XIP holds the grant ----
+    // qspi_arbiter.sv now forwards a_abort unconditionally, regardless of
+    // which side holds the grant (see arbiter comments) - abort is a
+    // safety/override mechanism, not a normal arbitrated request. This
+    // verifies a register-path ABORT write genuinely cuts short an
+    // in-flight XIP fetch, reported back to the XIP requester as an
+    // error rather than completing with real data.
+    begin
+      logic [31:0] xip_data;
+      logic [1:0]  xip_resp;
+      logic [31:0] abort_ctrl_cmd;
+
+      @(posedge ACLK);
+      XIP_ARADDR = 32'h0100_0040; XIP_ARVALID = 1'b1;
+
+      fork
+        begin
+          while (!(XIP_ARVALID && XIP_ARREADY)) @(posedge ACLK);
+          @(posedge ACLK); XIP_ARVALID <= 1'b0;
+          XIP_RREADY <= 1'b1;
+          while (!XIP_RVALID) @(posedge ACLK);
+          xip_data = XIP_RDATA; xip_resp = XIP_RRESP;
+          @(posedge ACLK); XIP_RREADY <= 1'b0;
+        end
+        begin
+          // Wait until the XIP transaction is genuinely mid-flight
+          // (past CMD, into ADDR for this single-line config) before
+          // attempting the abort.
+          repeat (20) @(posedge ACLK);
+          abort_ctrl_cmd = 32'h0;
+          abort_ctrl_cmd[CTRL_BIT_ABORT] = 1'b1;
+          axi_write(REG_CTRL_CMD, abort_ctrl_cmd);
+        end
+      join
+
+      report("abort_cuts_short_xip_transaction",
+             xip_resp === 2'b10,
+             $sformatf("(Register-path ABORT should cut short the in-flight XIP fetch, reported as DECERR - got resp=%b data=%08h)",
+                       xip_resp, xip_data));
+    end
+
+    // ---- 6. Timeout while XIP holds the grant ----
+    // Reconfigure XIP_CFG with near-maximum dummy cycles so a single XIP
+    // fetch exceeds this DUT instance's TIMEOUT_CYCLES(150) override.
+    // Checks: (a) the XIP request correctly sees the resulting error
+    // response rather than hanging, and (b) the grant releases cleanly
+    // afterward so a subsequent, ordinary register-path transaction still
+    // works - i.e. a timeout on the XIP side doesn't leave the arbiter
+    // stuck.
+    begin
+      logic [31:0] slow_xip_cfg;
+      logic [31:0] xip_data;
+      logic [1:0]  xip_resp;
+      logic [31:0] status_val;
+      logic [1:0]  status_resp;
+
+      slow_xip_cfg = (1 << XIP_CFG_BIT_ENABLE) | (255 << 13) | 32'h0B;
+      axi_write(REG_XIP_CFG, slow_xip_cfg);
+
+      xip_read(32'h0100_0050, xip_data, xip_resp);
+      report("xip_timeout_reports_error", xip_resp === 2'b10,
+             $sformatf("(Expected DECERR from timeout-triggered engine error, got resp=%b)", xip_resp));
+
+      // Grant-recovery check: restore normal XIP_CFG and confirm a
+      // completely ordinary register-path transaction still works -
+      // i.e. the arbiter didn't get stuck holding GNT_XIP forever.
+      axi_write(REG_XIP_CFG, (1 << XIP_CFG_BIT_ENABLE) | (8 << 13) | 32'h0B);
+      axi_read(REG_STATUS, status_val, status_resp);
+      report("register_path_recovers_after_xip_timeout", status_resp === 2'b00,
+             $sformatf("(Register-path STATUS read after XIP timeout: resp=%b, expected 00)", status_resp));
+    end
+
+    // ---- 7. XIP_CFG written mid-flight does not corrupt an in-progress fetch ----
+    // The already-latched configuration inside qspi_engine should govern
+    // an in-progress transaction regardless of what XIP_CFG is
+    // overwritten to while that transaction is still running.
+    begin
+      logic [31:0] xip_data;
+      logic [1:0]  xip_resp;
+
+      @(posedge ACLK);
+      XIP_ARADDR = 32'h0100_0060; XIP_ARVALID = 1'b1;
+
+      fork
+        begin
+          while (!(XIP_ARVALID && XIP_ARREADY)) @(posedge ACLK);
+          @(posedge ACLK); XIP_ARVALID <= 1'b0;
+          XIP_RREADY <= 1'b1;
+          while (!XIP_RVALID) @(posedge ACLK);
+          xip_data = XIP_RDATA; xip_resp = XIP_RRESP;
+          @(posedge ACLK); XIP_RREADY <= 1'b0;
+        end
+        begin
+          repeat (15) @(posedge ACLK);
+          // Overwrite XIP_CFG with a deliberately different (bogus)
+          // config while the above transaction is still in flight.
+          axi_write(REG_XIP_CFG, (1 << XIP_CFG_BIT_ENABLE) | (2 << 13) | 32'hFF);
+        end
+      join
+
+      report("xip_cfg_write_mid_flight_does_not_corrupt", 
+             (xip_resp === 2'b00) && (xip_data === 32'h63626160),
+             $sformatf("(In-flight fetch should use its ORIGINALLY latched config - got resp=%b data=%08h, expected resp=00 data=63626160)",
+                       xip_resp, xip_data));
+    end
+
+    // ---- 8. Dual-line XIP fetch ----
+    // Tests: only single-line XIP data had ever been exercised before this.
+    // Expected: address 0x0100_0080 -> flash offset 0x80..0x83 ->
+    // little-endian word 0x83828180.
+    begin
+      logic [31:0] dual_xip_cfg;
+      logic [31:0] xip_data;
+      logic [1:0]  xip_resp;
+
+      dual_xip_cfg = (1 << XIP_CFG_BIT_ENABLE) | (8 << 13) | (LW_DUAL << 10) | (LW_SINGLE << 8) | 32'h3B;
+      axi_write(REG_XIP_CFG, dual_xip_cfg);
+
+      xip_read(32'h0100_0080, xip_data, xip_resp);
+      report("xip_dual_line_data_fetch", (xip_resp === 2'b00) && (xip_data === 32'h83828180),
+             $sformatf("(Got resp=%b data=%08h, expected resp=00 data=83828180)", xip_resp, xip_data));
+    end
+
+    // ---- 9. Quad-line XIP fetch ----
+    // Expected: address 0x0100_0090 -> flash offset 0x90..0x93 ->
+    // little-endian word 0x93929190.
+    begin
+      logic [31:0] quad_xip_cfg;
+      logic [31:0] xip_data;
+      logic [1:0]  xip_resp;
+
+      quad_xip_cfg = (1 << XIP_CFG_BIT_ENABLE) | (8 << 13) | (LW_QUAD << 10) | (LW_SINGLE << 8) | 32'h6B;
+      axi_write(REG_XIP_CFG, quad_xip_cfg);
+
+      xip_read(32'h0100_0090, xip_data, xip_resp);
+      report("xip_quad_line_data_fetch", (xip_resp === 2'b00) && (xip_data === 32'h93929190),
+             $sformatf("(Got resp=%b data=%08h, expected resp=00 data=93929190)", xip_resp, xip_data));
+    end
+
+    // ---- 10. Back-to-back XIP fetches ----
+    // Tests: repeated, rapid-succession XIP reads with no artificial delay
+    // between them - closer to how a real CPU's fetch unit would actually
+    // drive this interface than a single one-shot request ever exercises.
+    // Reverts to the normal single-line config first.
+    begin
+      logic [31:0] normal_xip_cfg;
+      logic [31:0] xip_data;
+      logic [1:0]  xip_resp;
+      logic        all_ok;
+      logic [31:0] base_addr;
+      logic [31:0] expected;
+
+      normal_xip_cfg = (1 << XIP_CFG_BIT_ENABLE) | (8 << 13) | 32'h0B;
+      axi_write(REG_XIP_CFG, normal_xip_cfg);
+
+      all_ok = 1'b1;
+      base_addr = 32'h0100_00A0;
+      for (int i = 0; i < 6; i++) begin
+        xip_read(base_addr + (i * 4), xip_data, xip_resp);
+        // single-line reads a byte at a time, still little-endian assembled:
+        // bytes (base+4i)..(base+4i+3), low byte first.
+        expected = {8'((base_addr[7:0] + i*4 + 3)), 8'((base_addr[7:0] + i*4 + 2)),
+                    8'((base_addr[7:0] + i*4 + 1)), 8'((base_addr[7:0] + i*4))};
+        if (xip_resp !== 2'b00 || xip_data !== expected) begin
+          all_ok = 1'b0;
+          $display("[BACK2BACK] fetch %0d MISMATCH: got resp=%b data=%08h, expected resp=00 data=%08h",
+                    i, xip_resp, xip_data, expected);
+        end
+      end
+      report("xip_back_to_back_fetches", all_ok,
+             "(6 consecutive XIP fetches, no delay between them, each independently checked)");
     end
 
     $display("=====================================");

@@ -1,11 +1,11 @@
 # QSPI Controller with AXI4-Lite Wrapper
 
-A QSPI flash controller with an AXI4-Lite register interface. It lets a CPU or AXI master control a QSPI flash transaction by writing and reading registers, while a separate QSPI engine generates the actual serial protocol on cs_n and io0-io3.
+A QSPI flash controller with an AXI4-Lite register interface. It lets a CPU or AXI master control a QSPI flash transaction by writing and reading registers, while a separate QSPI engine generates the actual serial protocol on cs_n and io0-io3. A second, memory-mapped XIP interface is also available, letting a CPU treat the flash as ordinary memory-mapped address space for reads.
 
 ## Background
 
 For the underlying protocol theory (AXI4-Lite, SPI/QSPI, clock domain
-crossing), see [THEORY.md](./THEORY.md).
+crossing, XIP), see [THEORY.md](./THEORY.md).
 
 For a signal-level trace of a transaction executing through the actual
 code, see [WALKTHROUGH.md](./WALKTHROUGH.md).
@@ -13,19 +13,43 @@ code, see [WALKTHROUGH.md](./WALKTHROUGH.md).
 ## Architecture
 
 ```
-AXI4-Lite bus                                          QSPI flash chip
-     |                                                        ^
-     v                                                        |
-+-----------+     +------------+     +--------------+   cs_n, io0-3
-| axi4L_    | --> | cdc_bridge | --> | qspi_engine  | --------------->
-| slave     |     | (ACLK <->  |     | (CMD/ADDR/   |
-| (ACLK     |     |  qclk CDC) |     |  DUMMY/DATA  |
-|  domain)  | <-- |            | <-- |  phase FSM)  |
-+-----------+     +------------+     +--------------+
+                    AXI4-Lite bus (register path)
+                         |            ^
+                         v            |
+                  +-----------+       |
+                  | axi4L_    |       |
+                  | slave     |       |
+                  +-----+-----+       |
+                        |             |
+XIP AXI4-Lite bus       v             |
+(memory-mapped,   +-----------+       |
+ read-only)  ---->| qspi_     |       |
+                   | arbiter  |       |
+                   +-----+-----+       |
+                        |             |
+                        v             |
+                  +------------+     +--------------+   cs_n, io0-3
+                  | cdc_bridge | --> | qspi_engine  | --------------->
+                  | (ACLK <->  |     | (CMD/ADDR/   |
+                  |  qclk CDC) |     |  DUMMY/DATA  |
+                  |            | <-- |  phase FSM)  |
+                  +------------+     +--------------+
 ```
 
 - **axi4L_slave.sv** — AXI4-Lite target: register bank, AW/W/B and AR/R
-  channel FSMs.
+  channel FSMs. Also holds the `XIP_CFG` register that configures the
+  fixed opcode/width/dummy-count used by every XIP-triggered access.
+- **qspi_xip_slave.sv** — a second, memory-mapped, read-only AXI4-Lite
+  slave. A read landing in the configured address window transparently
+  triggers a QSPI read through the shared engine, translating the AXI
+  address into a flash address and assembling the returned bytes into a
+  little-endian word.
+- **qspi_arbiter.sv** — arbitrates access to the shared engine between
+  the register path and the XIP path. The register path wins a same-
+  cycle start collision; each requester only ever sees its own
+  completion, never the other's. **ABORT is global** - forwarded to the
+  engine regardless of which side currently holds the grant, since it's
+  a safety/override mechanism, not a normal arbitrated request.
 - **cdc_bridge.sv** — crosses every control/status/data signal between the
   ACLK and qclk domains, since the AXI bus and the QSPI serial engine can
   run on independent, asynchronous clocks. Uses toggle-based pulse
@@ -33,10 +57,11 @@ AXI4-Lite bus                                          QSPI flash chip
   synchronizers for level signals.
 - **qspi_engine.sv** — the actual QSPI shift engine. Walks CMD → ADDR →
   DUMMY → DATA phases, driving/sampling `io0`–`io3` at 1/2/4 bits per
-  clock depending on configured line width.
+  clock depending on configured line width. Shared, unmodified, by both
+  the register path and the XIP path.
 - **qspi_axi_pkg.sv** — shared register offsets, bit-position constants,
   and FSM enums.
-- **qspi_axi_top.sv** — top-level wiring of the three modules above.
+- **qspi_axi_top.sv** — top-level wiring of all modules above.
 
 ## Register Map
 
@@ -48,13 +73,14 @@ AXI4-Lite bus                                          QSPI flash chip
 | 0x0C   | STATUS       | R/W*   | see bit layout below (*STATUS is written only for W1C bits) |
 | 0x10   | TX_DATA      | W      | next byte to transmit (write direction) |
 | 0x14   | RX_DATA      | R      | last byte received (read direction) |
+| 0x18   | XIP_CFG      | R/W    | see bit layout below; configures every XIP-triggered access |
 
 **CTRL_CMD bits:**
 
 | Bits | Field | Notes |
 |------|-------|-------|
 | 31:24 | reserved | |
-| 23 | ABORT | write 1 to immediately cancel any in-progress transaction, any phase |
+| 23 | ABORT | write 1 to immediately cancel any in-progress transaction, any phase, **regardless of whether it was started via the register path or via XIP** |
 | 22 | DIR | 0=read, 1=write |
 | 21 | START | write 1 to begin a transaction |
 | 20:13 | DUMMY_CYCLES | 0-255 |
@@ -74,34 +100,64 @@ AXI4-Lite bus                                          QSPI flash chip
 | 4 | ERROR | sticky, W1C | set if the timeout safety net fires (busy stuck far longer than any legitimate transfer should take) |
 | 31:5 | reserved | | |
 
-## Building and running the testbench
+**XIP_CFG bits:** (set once at boot, before enabling XIP - not re-specified per access, since a CPU fetch has no way to program a register before each read)
 
-Requires Verilator 5.x.
+| Bits | Field | Notes |
+|------|-------|-------|
+| 31 | XIP_ENABLE | gates whether the XIP interface accepts requests at all |
+| 20:13 | DUMMY_CYCLES | |
+| 12 | ADDR_WIDTH | 0=24-bit, 1=32-bit |
+| 11:10 | DATA_LINES | same encoding as CTRL_CMD |
+| 9:8 | ADDR_LINES | same encoding |
+| 7:0 | OPCODE | fixed read opcode used for every XIP access |
 
-**Verilator:**
+## ⚠️ Known limitations
+
+**No real multi-byte flow control.** `TX_READY`/`RX_READY` tell software
+when a byte needs servicing, but the engine does **not stall** waiting
+for that to happen — the byte stream keeps running at full `qclk` speed
+regardless. Real backpressure requires pausing the engine's internal
+counters mid-transfer, which is only safe if `qclk` is gated/enabled
+before it reaches the physical SCLK pin. That's a board/top-level detail
+outside these RTL files, and it was never confirmed.
+
+**No continuous/burst-read mode for XIP.** Every XIP access pays the full
+CMD+ADDR+DUMMY overhead of a fresh QSPI transaction — there is no
+mode-bits phase to enable continuous read mode. This makes XIP correct
+for occasional memory-mapped access but likely too slow to actually
+execute code from, without further work.
+
+## Building and running the testbenches
+
+Requires Verilator 5.x or Icarus Verilog.
+
+**Core register-path suite (18 tests):**
 ```bash
 verilator --binary --timing --trace -Wno-fatal --top-module tb_qspi_axi_top \
   qspi_axi_pkg.sv pulse_sync.sv cdc_bridge.sv axi4L_slave.sv \
-  qspi_engine.sv qspi_axi_top.sv qspi_flash_model.sv tb_qspi_axi_top.sv
+  qspi_engine.sv qspi_arbiter.sv qspi_xip_slave.sv qspi_axi_top.sv \
+  qspi_flash_model.sv tb_qspi_axi_top.sv
 ./obj_dir/Vtb_qspi_axi_top
 ```
+Expected: `SUMMARY: 18 pass, 0 fail`.
 
-Expected output: `SUMMARY: 17 pass, 0 fail`.
-
-The simulator dumps `tb_qspi_axi_top.vcd` in the working directory
-(`--trace` is required for this - without it, Verilator silently skips
-the dump). Open it with:
+**XIP suite (11 tests):**
 ```bash
-gtkwave tb_qspi_axi_top.vcd
+verilator --binary --timing -Wno-fatal --top-module tb_xip_qspi_axi_top \
+  qspi_axi_pkg.sv pulse_sync.sv cdc_bridge.sv axi4L_slave.sv qspi_engine.sv \
+  qspi_arbiter.sv qspi_xip_slave.sv qspi_axi_top.sv qspi_flash_model.sv \
+  tb_xip_qspi_axi_top.sv
+./obj_dir/Vtb_xip_qspi_axi_top
 ```
+Expected: `SUMMARY: 11 pass, 0 fail`.
 
 Note the simulation's time unit is **picoseconds**, not nanoseconds — the
 GTKWave time axis and the `From:`/`To:` zoom fields will show `ps`.
 
-
 ## Verification status
 
-All 17 testbench cases pass on Verilator 5.032.
+All 18 core testbench cases and all 11 XIP testbench cases pass on both
+Icarus Verilog and Verilator 5.032.
 
 **RTL bugs found and fixed (qspi_engine.sv, cdc_bridge.sv):**
 - RX capture losing the first nibble/bit of every byte (timing race
@@ -117,16 +173,48 @@ All 17 testbench cases pass on Verilator 5.032.
 **Register-map / architecture additions:**
 - STATUS.DONE changed from a raw single-cycle pulse (effectively
   unobservable by polling) to a sticky, write-1-to-clear bit
-- Abort/cancel support (CTRL_CMD bit 23)
+- Abort/cancel support (CTRL_CMD bit 23) - **global**, works regardless
+  of which side (register path or XIP) currently holds the engine
 - Timeout safety net with a dedicated ERROR status bit
 - TX_READY/RX_READY visibility bits (see flow-control caveat above)
 - Dual/quad-line ADDRESS phase verified for the first time (previously
   only single-line addressing had ever been exercised, regardless of
   data width)
+- Mixed line-width combination verified (quad address + single data,
+  the previously-untested opposite direction from the already-covered
+  single-address-plus-quad-data case)
+- Memory-mapped XIP read path, with arbitration against the existing
+  register interface
+
+**Bugs found and fixed in the XIP additions specifically (qspi_arbiter.sv, qspi_xip_slave.sv):**
+- `rx_data` incorrectly gated by grant state, breaking the register
+  path's own reads once a transaction had ended
+- Grant released before the slower-latency `rx_valid`/`tx_req`
+  synchronizer had time to arrive - fixed with a drain margin
+- A real AXI protocol violation: `ARREADY` gated on the XIP-enable bit,
+  meaning a disabled XIP interface could hang a master forever
+- `XIP_CFG` bit-layout collision - the enable bit originally overlapped
+  the opcode field
+- An NBA-timing race identical in class to the RX-timing bug above:
+  `x_rx_data` sampled one cycle too early relative to when `cdc_bridge`
+  actually settles it
+- Byte assembly was originally big-endian; corrected to little-endian,
+  matching how a real CPU (ARM/RISC-V/x86) expects a memory-mapped word
+  read to be laid out
+- A stale error condition from a *previous* transaction could still be
+  visible to a *new* transaction for a few cycles (CDC round-trip lag) -
+  fixed by gating error detection on having observed `busy` go high
+  first for the current transaction
+- After making abort global, a genuine new race appeared: `busy`
+  (fast level-sync) can drop before the slower, pulse-synced `rx_valid`
+  for the final byte has arrived, even during a completely normal
+  completion - `qspi_xip_slave.sv` was initially misreporting some
+  successful fetches as aborted. Fixed with a drain-margin counter,
+  the same pattern already used in the arbiter itself.
 
 ## Waveform Evidence
 
-Every capture below is from the actual `tb_qspi_axi_top.sv` simulation
+Every capture below is from the core `tb_qspi_axi_top.sv` simulation
 (Verilator 5.032), GTKWave, signals added via their full hierarchical
 path (e.g. `tb_qspi_axi_top.u_dut.u_qspi_engine.phase`).
 
@@ -198,6 +286,9 @@ disagree, which is the XOR edge-detect working as designed.
 coincidental completion. `busy_r` and `cs_n` both flip the same cycle
 `qspi_abort` pulses, and `qspi_done` stays low for the entire window,
 confirming this was a cut-short abort, not a disguised normal completion.
+(This capture is from the register-path abort test; abort's behavior
+while XIP holds the grant is covered separately by the XIP suite's
+`abort_cuts_short_xip_transaction` test.)
 
 ### 6. Timeout safety net
 

@@ -72,6 +72,24 @@ module qspi_xip_slave #(
   logic [31:0] assemble_reg;
   logic [2:0]  byte_count;
   logic        fetch_error;
+  logic        engine_busy_seen; // guards against a STALE x_error left over from a
+                                 // PREVIOUS transaction still being visible for a few
+                                 // cycles into a NEW one - error_r inside qspi_engine.sv
+                                 // only clears when a fresh qspi_start is accepted, and
+                                 // the CDC-synced view of that clearing (axi_error, a
+                                 // 2-flop level sync) lags a few cycles behind the real
+                                 // clearing. Waiting for busy to be confirmed high first
+                                 // sidesteps this: busy asserts on the same qclk edge
+                                 // error_r clears, so by the time THIS new transaction's
+                                 // busy is visible through its own CDC path, any leftover
+                                 // stale error has had at least as long to clear too.
+  logic [3:0]  drain_cnt; // after busy drops, wait a few more cycles before concluding
+                          // the transaction was aborted rather than completed normally -
+                          // busy (a fast level-sync) can drop before the pulse-synced
+                          // rx_valid for the FINAL byte has actually arrived, since the
+                          // two use different synchronizer latencies. Same fix pattern as
+                          // qspi_arbiter.sv's own DRAIN_CYCLES margin.
+  localparam int XIP_DRAIN_CYCLES = 6;
   logic        x_rx_valid_d1; // x_rx_data only settles to its correct new value the
                               // cycle AFTER x_rx_valid pulses (cdc_bridge.sv's
                               // axi_rx_data updates via a same-edge nonblocking
@@ -110,21 +128,25 @@ module qspi_xip_slave #(
 
   always_ff @(posedge ACLK or negedge ARESETn) begin
     if (!ARESETn) begin
-      state           <= XIP_IDLE;
-      ar_addr_latched <= '0;
-      assemble_reg    <= '0;
-      byte_count      <= '0;
-      fetch_error     <= 1'b0;
-      x_start         <= 1'b0;
+      state            <= XIP_IDLE;
+      ar_addr_latched  <= '0;
+      assemble_reg     <= '0;
+      byte_count       <= '0;
+      fetch_error      <= 1'b0;
+      x_start          <= 1'b0;
+      engine_busy_seen <= 1'b0;
+      drain_cnt        <= '0;
     end else begin
       x_start <= 1'b0; // default: only pulses explicitly below, one cycle
 
       case (state)
         XIP_IDLE: begin
           if (AXI_ARVALID && AXI_ARREADY) begin
-            ar_addr_latched <= AXI_ARADDR;
-            byte_count      <= '0;
-            assemble_reg    <= '0;
+            ar_addr_latched  <= AXI_ARADDR;
+            byte_count       <= '0;
+            assemble_reg     <= '0;
+            engine_busy_seen <= 1'b0;
+            drain_cnt        <= '0;
             if (xip_cfg[XIP_CFG_BIT_ENABLE] && addr_in_range_live) begin
               state       <= XIP_REQ;
               fetch_error <= 1'b0;
@@ -145,7 +167,8 @@ module qspi_xip_slave #(
         end
 
         XIP_COLLECT: begin
-          if (x_error) begin
+          if (x_busy) engine_busy_seen <= 1'b1;
+          if (engine_busy_seen && x_error) begin
             fetch_error <= 1'b1;
             state       <= XIP_RESP;
           end else if (x_rx_valid_d1) begin
@@ -157,6 +180,13 @@ module qspi_xip_slave #(
             // ordering question at all, being one byte) - it only
             // matters here because XIP assembles multiple bytes into one
             // word for a real fetch unit to consume.
+            //
+            // This check must come BEFORE the busy-dropped abort
+            // detection below: busy legitimately drops on/around the
+            // same cycle as the FINAL byte's valid pulse during a normal
+            // completion, and checking abort-detection first would steal
+            // that cycle, losing the last byte and misreporting a
+            // successful fetch as an aborted one.
             case (byte_count)
               0: assemble_reg[7:0]   <= x_rx_data;
               1: assemble_reg[15:8]  <= x_rx_data;
@@ -167,6 +197,23 @@ module qspi_xip_slave #(
               state <= XIP_RESP;
             end else begin
               byte_count <= byte_count + 1'b1;
+            end
+          end else if (engine_busy_seen && !x_busy) begin
+            // busy has dropped. This could mean either (a) the transaction
+            // completed normally and the final byte's rx_valid_d1 pulse is
+            // still in flight (it uses a slower, pulse-synced path than
+            // busy's fast level-sync, so it can genuinely arrive a few
+            // cycles after busy itself drops), or (b) a real abort cut the
+            // transaction short and no more pulses are ever coming. Wait
+            // XIP_DRAIN_CYCLES to distinguish the two - same fix pattern
+            // as qspi_arbiter.sv's own DRAIN_CYCLES margin. Only declare
+            // an abort/error if that whole window passes with nothing
+            // arriving.
+            if (drain_cnt == XIP_DRAIN_CYCLES - 1) begin
+              fetch_error <= 1'b1;
+              state       <= XIP_RESP;
+            end else begin
+              drain_cnt <= drain_cnt + 1'b1;
             end
           end
         end

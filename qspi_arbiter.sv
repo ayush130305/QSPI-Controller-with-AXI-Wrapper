@@ -129,9 +129,18 @@ module qspi_arbiter (
   // registered grant) for the actual START pulse, since grant only
   // updates on the NEXT edge - the qspi_start pulse itself needs to reach
   // cdc_bridge the SAME cycle the request fires, not one cycle later.
+  //
+  // axi_abort is deliberately NOT gated by grant at all - abort is a
+  // safety/override mechanism (an emergency stop), not a normal
+  // arbitrated request. If it only worked while the register path
+  // itself held the grant, there would be no way to recover a hung XIP
+  // transaction short of a full reset, which defeats the point of having
+  // an abort path in the first place. The register interface can always
+  // cut short whatever is currently running, XIP-triggered or not.
+  assign axi_abort = a_abort;
+
   always_comb begin
     axi_start     = 1'b0;
-    axi_abort     = 1'b0;
     axi_ctrl_cmd  = '0;
     axi_addr      = '0;
     axi_num_bytes = '0;
@@ -141,7 +150,6 @@ module qspi_arbiter (
       GNT_NONE: begin
         if (a_start) begin
           axi_start     = a_start;
-          axi_abort     = a_abort;
           axi_ctrl_cmd  = a_ctrl_cmd;
           axi_addr      = a_addr;
           axi_num_bytes = a_num_bytes;
@@ -155,7 +163,6 @@ module qspi_arbiter (
       end
       GNT_REG: begin
         axi_start     = a_start;
-        axi_abort     = a_abort;
         axi_ctrl_cmd  = a_ctrl_cmd;
         axi_addr      = a_addr;
         axi_num_bytes = a_num_bytes;

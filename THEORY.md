@@ -1,4 +1,4 @@
-# Protocol Theory: AXI4-Lite, SPI/QSPI, and Clock Domain Crossing
+# Protocol Theory: AXI4-Lite, SPI/QSPI, Clock Domain Crossing, and XIP
 
 **Project:** QSPI Controller with AXI4-Lite Wrapper
 **Scope:** This document explains the protocol and digital-design theory
@@ -24,6 +24,9 @@ project implements two such protocols and bridges them:
 
 - **AXI4-Lite** between the CPU/interconnect and this IP block
 - **QSPI** (an extension of SPI) between this IP block and the flash chip
+
+A third layer, **XIP**, builds on top of both without introducing a new
+wire-level protocol of its own - see Section 6.
 
 ## 2. AXI4-Lite: the register interface
 
@@ -67,6 +70,11 @@ either side needing advance knowledge of the other's timing.
 `axi4L_slave.sv` computes this condition directly:
 `aw_hs = AXI_AWVALID & AXI_AWREADY` (and equivalently for each of the
 other four channels).
+
+A slave must always eventually respond to a valid request, even if that
+response is an error (DECERR/SLVERR) - refusing to ever assert READY is
+a protocol violation, not a valid way to reject a request. This matters
+directly for `qspi_xip_slave.sv`; see Section 6.2.
 
 ### 2.4 Address decoding
 
@@ -206,25 +214,125 @@ type:
 This distinction, and `cdc_bridge.sv`'s consistent application of it, is
 the central design principle of that file.
 
-## 6. Summary
+## 6. XIP: memory-mapped execution
+
+### 6.1 What XIP actually is
+
+Normally, using external flash means software explicitly orchestrates
+each transfer: write control registers, poll for completion, read the
+result. XIP (eXecute-in-Place) inverts this - the flash is mapped
+directly into the CPU's address space, so an ordinary memory read (or
+instruction fetch) transparently triggers the underlying transfer, with
+no register protocol visible to the software issuing the read. This
+matters because a CPU's fetch unit has no mechanism for polling a status
+register between instructions - it expects "read address X, get data
+back," nothing more.
+
+XIP is not a new wire-level protocol. It is a different *master-facing
+contract* placed in front of the same AXI4-Lite and QSPI mechanisms
+already described in Sections 2-4. `qspi_xip_slave.sv` is, structurally,
+just another AXI4-Lite slave (Section 2's channel/handshake rules apply
+to it unchanged) that happens to translate its own address space into
+QSPI transactions instead of exposing raw registers.
+
+### 6.2 Fixed configuration, and why
+
+A register-based transfer lets software specify opcode, address width,
+line width, and dummy-cycle count fresh for every transaction. XIP
+cannot do this - there is no register-write step in a CPU's read path.
+Instead, `XIP_CFG` is configured once, before XIP is enabled, and every
+subsequent XIP-triggered transaction reuses that fixed configuration.
+This is a direct consequence of Section 6.1's central fact: if the
+CPU's read path can't run software between "decide to read" and "read
+happens," the configuration has to already be decided.
+
+One consequence worth stating plainly, since it's easy to get backwards:
+a slave that refuses to respond when disabled is not "safely rejecting"
+anything - per Section 2.3's handshake rule, every request needs a
+response, even an error one. `qspi_xip_slave.sv`'s `ARREADY` therefore
+asserts unconditionally whenever idle; the disabled/out-of-range cases
+are distinguished by the *response* (DECERR), not by withholding the
+handshake itself.
+
+### 6.3 Arbitration: one engine, two requesters
+
+The register-path interface and the XIP interface both ultimately need
+the same QSPI engine (Section 4), and only one transaction can be in
+flight on the physical QSPI wires at a time. This is an ordinary shared-
+resource arbitration problem: `qspi_arbiter.sv` grants access to
+whichever requester asks first, with the register path winning any
+same-cycle tie (explicit software control takes priority over an
+opportunistic memory-mapped fetch). Each requester is only ever shown
+the engine's status signals while it actually holds the grant, so one
+side's transaction completing can never look like the other side's
+transaction finishing.
+
+Abort is the one signal deliberately exempted from this grant-based
+routing. It is forwarded to the engine unconditionally, regardless of
+which side currently holds the grant. This is a different kind of
+signal than `start`/`ctrl_cmd`/`addr` - it is not a new operation
+competing for the shared resource, it is an override on whatever
+operation is already running. Gating it by grant would mean a hung or
+misbehaving XIP-triggered transaction could only ever be recovered by a
+full reset, which defeats the purpose of having an abort mechanism at
+all.
+
+A subtlety specific to this design's own CDC layer (Section 5): the
+level-synchronized `busy` signal and the pulse-synchronized `rx_valid`/
+`tx_req`/`done` signals do not necessarily resolve on the same cycle for
+the same underlying event, since they use different synchronizer depths.
+An arbiter releasing its grant purely on "busy has dropped" can therefore
+release one cycle before a still-in-flight status pulse for that same
+transaction arrives - a real, simulator-observable version of exactly
+the kind of cross-domain timing assumption Section 5.2 warns about in
+the abstract. The identical hazard resurfaces one layer up, in
+`qspi_xip_slave.sv` itself: once abort could cut a transaction short at
+any point, the XIP slave needed its own way to distinguish "busy dropped
+because the transaction is genuinely finished (the final byte's pulse-
+synced `rx_valid` may still be a few cycles from arriving)" from "busy
+dropped because abort cut it off (no further pulses are coming at all)."
+Both cases look identical - busy low, no further activity yet - for a
+brief window, which is exactly why both need the same drain-margin fix:
+wait a few cycles before concluding the second case, since one is common
+and expected, the other is not.
+
+### 6.4 Byte-to-word assembly and endianness
+
+A register-path read exposes exactly one byte at a time through
+`RX_DATA` - there is no ordering question, since there is nothing to
+order. XIP is different: a single CPU read expects a whole word (4
+bytes) back, assembled from 4 individually-arriving QSPI bytes. This
+introduces a genuine question with a correct answer: which arriving byte
+becomes the word's most significant, and which its least. Real CPUs
+(ARM, RISC-V, x86) are little-endian for this kind of access - the byte
+from the *lowest* address occupies the *lowest* byte position of the
+word. `qspi_xip_slave.sv` assembles bytes accordingly, placing the
+first-arriving byte at bits `[7:0]`, not `[31:24]`.
+
+## 7. Summary
 
 Software issues AXI4-Lite register writes describing a desired QSPI
-transaction. `axi4L_slave.sv` implements the AXI4-Lite-facing interface.
-`cdc_bridge.sv` transports the resulting control, status, and data
-signals across the ACLK/qclk boundary using the synchronization
+transaction, or a CPU issues an ordinary memory read that lands in the
+XIP address window. `axi4L_slave.sv` implements the AXI4-Lite register
+interface; `qspi_xip_slave.sv` implements the memory-mapped XIP
+interface; `qspi_arbiter.sv` mediates between the two when both need the
+engine. `cdc_bridge.sv` transports the resulting control, status, and
+data signals across the ACLK/qclk boundary using the synchronization
 strategies described in Section 5. `qspi_engine.sv` implements the
 QSPI-facing protocol engine, executing the phase sequence described in
-Section 4. `qspi_flash_model.sv` is a behavioral stand-in for a physical
-flash device, used exclusively for simulation.
+Section 4, shared unmodified by both requesters. `qspi_flash_model.sv`
+is a behavioral stand-in for a physical flash device, used exclusively
+for simulation.
 
-The design applies established AXI4-Lite, QSPI, and CDC theory; it does
-not introduce novel protocol mechanisms.
+The design applies established AXI4-Lite, QSPI, and CDC theory, and
+layers a standard XIP access pattern on top; it does not introduce novel
+protocol mechanisms.
 
-## 7. References
- 
+## 8. References
+
 Each entry below is tied to the specific section of this document - and,
 by extension, the specific file(s) in the RTL - it informed.
- 
+
 | Source | Informs |
 |---|---|
 | ARM. ["AXI Protocol Overview"](https://developer.arm.com/documentation/102202/0300/AXI-protocol-overview) - ARM Developer Documentation | **Section 2** (AXI4-Lite channel structure, VALID/READY handshaking). Directly underlies the AW/W/B/AR/R channel split and handshake logic implemented in `axi4L_slave.sv`. |
