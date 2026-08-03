@@ -335,3 +335,62 @@ stays set well after `qspi_done` has gone low again. `AXI_RDATA` reads
 bit-specific and doesn't disturb TX_READY/RX_READY sitting in the same
 register. This is the direct, visual fix for the original "STATUS.done
 is a raw pulse and essentially unpollable" finding.
+
+## XIP Waveform Evidence
+
+Every capture below is from the `tb_xip_qspi_axi_top.sv` simulation.
+These document mechanisms specific to the XIP path that the core suite's
+7 captures above don't touch at all: arbitration between the two
+requesters, abort's global reach, and multi-byte word assembly.
+
+### 8. Arbiter routing during a register-path / XIP collision
+
+<img width="2253" height="324" alt="waveform_8_xip_status_concurrent" src="https://github.com/user-attachments/assets/1b6b36f8-d07d-44bd-a647-2944f4b22c0a" />
+
+
+**Window:** ~1855ps–3465ps
+**Signals:** `u_arbiter.grant`, `u_arbiter.a_start`, `u_arbiter.x_start`, `u_arbiter.axi_start`, `u_axi_slave.qspi_busy` (this is `a_busy` as seen by the register path), `u_xip_slave.x_busy` (**Note:** `x_busy` is internal to `qspi_arbiter.sv`'s port connections - add it via `u_arbiter.x_busy` instead if `u_xip_slave`'s own view isn't in your signal tree)
+
+**Proves:** with both `a_start` and `x_start` high the same cycle, `grant`
+resolves to `GNT_REG` (register path wins the tie), and only the
+register path's own busy signal goes high for that first transaction -
+the XIP path's busy stays low until its turn comes, confirming neither
+side sees the other's transaction as its own.
+
+### 9. Global abort cutting short an XIP transaction
+
+<img width="2259" height="396" alt="waveform_9_global_abort_xip" src="https://github.com/user-attachments/assets/70b64055-8f8c-4e4c-a6f6-54216de4313f" />
+
+
+**Window:** ~3465ps–3845ps
+**Signals:** `u_arbiter.grant`, `u_axi_slave.qspi_abort` (this is `a_abort`), `u_arbiter.axi_abort`, `u_xip_slave.state`, `u_xip_slave.fetch_error`, `XIP_RRESP`
+
+**Proves:** `grant` reads `GNT_XIP` (the transaction in flight belongs to
+XIP, not the register path) at the exact moment `a_abort` pulses, yet
+`axi_abort` still asserts that same cycle - the unconditional forwarding
+working as designed. `u_xip_slave.state` should be seen leaving
+`XIP_COLLECT` for `XIP_RESP` shortly after (via the drain-margin delay,
+not instantly), `fetch_error` sets, and `XIP_RRESP` reads `2'b10`
+(DECERR) - a register-path abort genuinely reaching and cutting short a
+transaction it didn't start.
+
+### 10. Little-endian byte assembly
+
+<img width="2249" height="301" alt="waveform_10_little_endian_assembly" src="https://github.com/user-attachments/assets/61124e30-006a-4f8b-9273-ca7e696e1178" />
+
+**Window:** ~145ps–1805ps
+**Signals:** `u_xip_slave.x_rx_valid_d1`, `u_xip_slave.byte_count`, `u_xip_slave.assemble_reg`, `XIP_RDATA`
+
+**Proves:** each `x_rx_valid_d1` pulse lands a new byte at a *specific*
+position in `assemble_reg` (bits `[7:0]` on the first pulse, `[31:24]`
+on the fourth) rather than a uniform shift-in - watch `assemble_reg`
+build up `10`, `1110`, `121110`, then finally `13121110` across the four
+pulses, confirming the first-arriving byte (lowest address) ends up in
+the low byte of the word, not the high byte.
+
+---
+
+*Fill in each `[ INSERT WAVEFORM SCREENSHOT HERE ]` marker the same way
+as the 7 captures above - GTKWave, zoom into the stated window, add the
+listed signals via their full hierarchical path (e.g.
+`tb_xip_qspi_axi_top.u_dut.u_arbiter.grant`), export or screenshot.*
