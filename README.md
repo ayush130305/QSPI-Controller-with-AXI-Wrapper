@@ -388,9 +388,3 @@ build up `10`, `1110`, `121110`, then finally `13121110` across the four
 pulses, confirming the first-arriving byte (lowest address) ends up in
 the low byte of the word, not the high byte.
 
----
-
-*Fill in each `[ INSERT WAVEFORM SCREENSHOT HERE ]` marker the same way
-as the 7 captures above - GTKWave, zoom into the stated window, add the
-listed signals via their full hierarchical path (e.g.
-`tb_xip_qspi_axi_top.u_dut.u_arbiter.grant`), export or screenshot.*
